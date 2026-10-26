@@ -33,8 +33,11 @@ CSV columns (blank = not provided by that protocol / invalid): `unix_time_s`, `p
 `finger_ppg_compare.py` reads it directly.
 
 Usage: Search -> connect -> pick **BERRY** (sends `E1`, then `F4` for the original unfiltered ADC sample; pick a
-rate if you want other than the 100 Hz default) or **BCI** -> **Start**. If BERRY shows no PI/RR/packet rate after
-a few seconds the firmware does not support that protocol; use BCI.
+rate if you want other than the 100 Hz default) or **BCI** -> **Start**. The parser decodes whichever framing the
+device actually sends regardless of the radio button (a toast says "Receiving BCI/BERRY packets" and the rate
+field shows it), so the CSV is never empty because of a wrong selection; if the device keeps sending BCI after
+`E1`, its firmware does not implement the BERRY protocol. Alongside the CSV, `berrymed_<date>.raw.hex` keeps
+every BLE notification as hex (`<host time> <length> <bytes>`) so an undocumented framing can still be analysed.
 
 The parser was unit-tested against synthetic BCI and BERRY byte streams; the app itself has not yet been run on
 a phone from this branch - treat the first night as a test.

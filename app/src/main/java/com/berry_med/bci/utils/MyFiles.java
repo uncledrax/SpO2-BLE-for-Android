@@ -23,7 +23,9 @@ public class MyFiles {
     private String filePath = "";
     private BufferedWriter writer;
     private BufferedWriter csv;
+    private BufferedWriter raw;
     private long pktIndex = 0;
+    private static final char[] HEX = "0123456789abcdef".toCharArray();
     public static final String CSV_HEADER = "unix_time_s,pkt_index,proto,dev_pkt_index,pleth,adc,spo2,spo2_real,pr,pr_real,"
             + "rr_interval_ms,pi,pi_real,signal_strength,bargraph,no_signal,probe_unplugged,no_finger,pulse_searching,beep,"
             + "battery,packet_freq";
@@ -79,6 +81,9 @@ public class MyFiles {
             csv.write(CSV_HEADER + "\n");
             csv.flush();
             pktIndex = 0;
+            // every BLE notification as "<host time> <length> <hex>": whatever the device sends is kept
+            raw = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(filePath.replace(".csv", ".raw.hex"), false),
+                    StandardCharsets.UTF_8), 1 << 16);
         } catch (Exception e) {
             //noinspection CallToPrintStackTrace
             e.printStackTrace();
@@ -103,7 +108,22 @@ public class MyFiles {
                     bci ? String.valueOf((int) pi) : "", bci ? v(freq) : "",
                     (status >> 2) & 1, status & 1, (status >> 1) & 1, bci ? String.valueOf((status >> 2) & 1) : "",
                     (status >> 3) & 1, v(battery), bci ? "100" : v(freq)));
-            if (pktIndex % 200 == 0) csv.flush();
+            if (pktIndex % 200 == 0) { csv.flush(); if (raw != null) raw.flush(); }
+        } catch (Exception e) {
+            //noinspection CallToPrintStackTrace
+            e.printStackTrace();
+        }
+    }
+
+    public synchronized void writeRaw(long hostMs, byte[] data) {
+        if (raw == null) return;
+        try {
+            StringBuilder sb = new StringBuilder(data.length * 2 + 24);
+            sb.append(hostMs / 1000).append('.').append(String.format(Locale.US, "%03d", hostMs % 1000))
+              .append(' ').append(data.length).append(' ');
+            for (byte b : data) sb.append(HEX[(b >> 4) & 0xF]).append(HEX[b & 0xF]);
+            sb.append('\n');
+            raw.write(sb.toString());
         } catch (Exception e) {
             //noinspection CallToPrintStackTrace
             e.printStackTrace();
@@ -113,11 +133,13 @@ public class MyFiles {
     public synchronized void closeCsv() {
         try {
             if (csv != null) { csv.flush(); csv.close(); }
+            if (raw != null) { raw.flush(); raw.close(); }
         } catch (Exception e) {
             //noinspection CallToPrintStackTrace
             e.printStackTrace();
         }
         csv = null;
+        raw = null;
     }
 
     public void close() {

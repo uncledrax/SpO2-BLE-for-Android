@@ -153,7 +153,7 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
                         prTv.setText(pr != 255 ? String.valueOf(pr) : "--");
                         piTv.setText(pi != 0 ? String.valueOf(pi) : "--");
                         rrTv.setText(rr != 0 ? String.valueOf(rr) : "--");
-                        packetFreq.setText(pf != -1 ? pf + "Hz" : "--");
+                        packetFreq.setText(pf != -1 ? "BERRY " + pf + "Hz" : "BCI");
                         myFiles.writeTxt(currentTime, rr, pr, spo2);
                         startTime = currentTime;
                     }
@@ -168,6 +168,11 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
             }
 
             @Override
+            public void protocol(String proto) {
+                runOnUiThread(() -> ToastUtil.showToastShort("Receiving " + proto + " packets"));
+            }
+
+            @Override
             public void hardwareVersion(String v) {
                 runOnUiThread(() -> hw.setText(v));
             }
@@ -177,6 +182,7 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
                 runOnUiThread(() -> sw.setText(v));
             }
         });
+        mParseRunnable.setRawSink((ms, data) -> myFiles.writeRaw(ms, data));
     }
 
 

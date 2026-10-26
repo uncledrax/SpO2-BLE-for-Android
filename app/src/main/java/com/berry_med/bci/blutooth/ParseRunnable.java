@@ -1,23 +1,31 @@
 package com.berry_med.bci.blutooth;
 
 import java.text.DecimalFormat;
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.List;
-import java.util.concurrent.LinkedBlockingQueue;
 
 /*
- * description: ParseRunnable
- * author: zl
- * date: 2024/10/23 10:29
+ * description: ParseRunnable - decodes the oximeter byte stream.
+ *
+ * Both wire formats of the "BCI & BERRY Protocol V1.0" are recognised automatically, whatever the
+ * protocol radio button says (that only chooses what the screen shows):
+ *   BCI   5-byte packets, head byte has bit 7 set, the other four bytes have it clear
+ *   BERRY 20-byte frames, head FF AA, checksum in byte 19
+ * Version replies (BCI: FF/FE + ASCII; BERRY: FF AA 'S'/'H' + ASCII) are recognised as packets.
+ *
+ * author: zl (original), rework for logging 2026
  */
 public class ParseRunnable implements Runnable {
-    protected LinkedBlockingQueue<Integer> oxiData = new LinkedBlockingQueue<>(256);
-    protected int[] parseBuf = new int[20];
     protected OnDataChangeListener mOnDataChangeListener;
+    private RawSink rawSink;
 
-    protected String currentModel = "";
-    private List<Integer> buffArray;
+    private final Object lock = new Object();
+    private byte[] buf = new byte[8192];
+    private int len = 0;
+    private volatile long lastChunkMs = 0;
+
+    private int berryLock = 0;         // > 0: inside a BERRY stream, do not read stray bytes as BCI packets
+    private String currentProto = "";
+    public int badChecksum = 0;
 
     boolean isStop = false;
 
@@ -31,7 +39,21 @@ public class ParseRunnable implements Runnable {
     }
 
     public void init() {
-        buffArray = new ArrayList<>();
+        synchronized (lock) {
+            len = 0;
+        }
+        berryLock = 0;
+        currentProto = "";
+        verMore = 0;
+    }
+
+    /** Receives every BLE notification as-is (for the raw hex dump). */
+    public interface RawSink {
+        void raw(long hostMs, byte[] data);
+    }
+
+    public void setRawSink(RawSink sink) {
+        rawSink = sink;
     }
 
     /**
@@ -55,30 +77,126 @@ public class ParseRunnable implements Runnable {
          */
         void packet(long hostMs, String proto, int devIdx, int status, int spo2, int spo2Real, int pr, int prReal,
                     int rrMs, double pi, double piReal, int wave, long adc, int battery, int freq);
+
+        /** The framing actually arriving changed: "BCI" or "BERRY". */
+        void protocol(String proto);
     }
 
-    private volatile long lastChunkMs = 0;
-
     /**
-     * Add the data from Bluetooth Device to The Queue.
+     * Add the data from Bluetooth Device to the buffer.
      *
      * @param data data from Bluetooth Device
      */
     public void add(byte[] data) {
-        try {
-            if (data != null) {
-                lastChunkMs = System.currentTimeMillis();
-                // Version replies are recognised inside the packet parsers (bciParse / berryParse). The old
-                // chunk-level "contains SV/HV" test threw away whole notifications whenever those two ASCII
-                // bytes occurred by chance in binary data - with the BERRY ADC bytes that is every ~30 s.
-                if (data.length >= 2) {
-                    for (byte d : data) oxiData.put(toUnsignedInt(d));
+        if (data == null || data.length == 0) return;
+        long now = System.currentTimeMillis();
+        lastChunkMs = now;
+        if (rawSink != null) rawSink.raw(now, data);
+        synchronized (lock) {
+            if (len + data.length > buf.length) {
+                if (len + data.length > 1 << 20) len = 0;          // parser stalled: drop the backlog
+                else buf = Arrays.copyOf(buf, Math.max(buf.length * 2, len + data.length));
+            }
+            System.arraycopy(data, 0, buf, len, data.length);
+            len += data.length;
+            lock.notifyAll();
+        }
+    }
+
+    /**
+     * Parsing the protocol as the manual.
+     */
+    @Override
+    public void run() {
+        int[] frame = new int[20];
+        byte[] work;
+        int n;
+        while (isStop) {
+            synchronized (lock) {
+                try {
+                    while (len < 5 && isStop) lock.wait(250);
+                } catch (InterruptedException e) {
+                    return;
+                }
+                n = len;
+                work = Arrays.copyOf(buf, n);
+            }
+            int pos = 0;
+            while (n - pos >= 5) {
+                int b0 = work[pos] & 0xFF;
+                if (b0 == 0xFF && (work[pos + 1] & 0xFF) == 0xAA) {            // BERRY 20-byte frame
+                    if (n - pos < 20) break;                                    // wait for the rest
+                    int sum = 0;
+                    for (int i = 0; i < 19; i++) sum += work[pos + i] & 0xFF;
+                    if ((sum & 0xFF) == (work[pos + 19] & 0xFF)) {
+                        for (int i = 0; i < 20; i++) frame[i] = work[pos + i] & 0xFF;
+                        berryFrame(frame);
+                        pos += 20;
+                        berryLock = 400;                                        // ~20 frames of slack
+                    } else {
+                        badChecksum++;
+                        pos++;
+                    }
+                    continue;
+                }
+                if (berryLock > 0) {                                            // stray bytes inside a BERRY stream
+                    berryLock--;
+                    pos++;
+                    continue;
+                }
+                if ((b0 & 0x80) == 0) {                                         // not a BCI head
+                    pos++;
+                    continue;
+                }
+                boolean inner = false;
+                for (int i = 1; i < 5; i++) if ((work[pos + i] & 0x80) != 0) inner = true;
+                if (inner) {                                                    // a head inside: truncated packet
+                    pos++;
+                    continue;
+                }
+                for (int i = 0; i < 5; i++) frame[i] = work[pos + i] & 0xFF;
+                bciPacket(frame);
+                pos += 5;
+            }
+            synchronized (lock) {                                               // drop what was consumed
+                if (pos > 0) {
+                    System.arraycopy(buf, pos, buf, 0, len - pos);
+                    len -= pos;
                 }
             }
-        } catch (Exception e) {
-            //noinspection CallToPrintStackTrace
-            e.printStackTrace();
         }
+    }
+
+    private void protoSeen(String p) {
+        if (!p.equals(currentProto)) {
+            currentProto = p;
+            mOnDataChangeListener.protocol(p);
+        }
+    }
+
+    // ---------------------------------------------------------------- BCI
+    private void bciPacket(int[] data) {
+        if (bciVersion(data)) return;
+        verMore = 0;
+        protoSeen("BCI");
+        int beep = data[0];
+        int wave = data[1];
+        int spo2 = data[4];
+        int pr = data[3] | ((data[2] & 0x40) << 1);
+        int resp = 0;
+        double pi;
+        if (Model.MODEL.equals("BCI-RESP")) {
+            pi = _calculatePi(beep, data[2]);
+        } else {
+            pi = data[0] & 0x0F;
+        }
+        mOnDataChangeListener.value(spo2, 0, pr, pi, resp, wave, -1);
+        int status = ((data[0] >> 5) & 1)                       // probe unplugged
+                | (((data[2] >> 4) & 1) << 1)                  // no finger
+                | ((((data[0] >> 4) | (data[2] >> 5)) & 1) << 2) // no signal / pulse searching
+                | (((data[0] >> 6) & 1) << 3);                 // beep
+        mOnDataChangeListener.packet(lastChunkMs, "BCI", -1, status, spo2, -1, pr, -1, -1, data[0] & 0x0F, -1,
+                wave, -1, -1, data[2] & 0x0F);
     }
 
     private String verText = "";
@@ -106,141 +224,28 @@ public class ParseRunnable implements Runnable {
         return true;
     }
 
-    /**
-     * Parsing the protocol as the manual.
-     */
-    @Override
-    public void run() {
-        int PACKAGE_LEN = 20;
-        int pending = -1;                       // a head byte that arrived early (resync)
-        while (isStop) {
-            int data = pending >= 0 ? pending : getData();
-            pending = -1;
-            if (Model.MODEL.equals("BERRY")) {
-                parseBuf[0] = data;
-                for (int i = 1; i < PACKAGE_LEN; i++) {
-                    parseBuf[i] = getData();
-                }
-                berryParse(parseBuf);
-            } else {
-                if ((data & 0x80) == 0) continue;   // not a packet head
-                parseBuf[0] = data;
-                int i = 1;
-                while (i < 5) {
-                    data = getData();
-                    if ((data & 0x80) != 0) {       // a head inside the packet: packet was truncated
-                        pending = data;
-                        break;
-                    }
-                    parseBuf[i++] = data;
-                }
-                if (i == 5) bciParse(parseBuf);
-            }
+    // ---------------------------------------------------------------- BERRY
+    private void berryFrame(int[] data) {
+        int packetFreq = data[18];
+        if (packetFreq == 0 && (data[2] == 0x53 || data[2] == 0x48)) {
+            // version reply: 'S'/'H' then an ASCII string, zero padded (PacketFreq is never 0 in data)
+            StringBuilder sb = new StringBuilder();
+            for (int k = 3; k < 19 && data[k] != 0; k++) sb.append((char) data[k]);
+            if (data[2] == 0x53) mOnDataChangeListener.softwareVersion(sb.toString());
+            else mOnDataChangeListener.hardwareVersion(sb.toString());
+            return;
         }
-    }
-
-    // BCI
-    private void bciParse(int[] data) {
-        if (bciVersion(data)) return;
-        verMore = 0;
-        int beep = data[0];
-        int wave = data[1];
+        protoSeen("BERRY");
         int spo2 = data[4];
-        int pr = data[3] | ((data[2] & 0x40) << 1);
-        int resp = 0;
-        double pi = 0.0;
-        if (Model.MODEL.equals("BCI-RESP")) {
-            pi = _calculatePi(beep, data[2]);
-            resp = data[6];
-        } else {
-            pi = data[0] & 0x0F;
-        }
-        mOnDataChangeListener.value(spo2, 0, pr, pi, resp, wave, -1);
-        int status = ((data[0] >> 5) & 1)                       // probe unplugged
-                | (((data[2] >> 4) & 1) << 1)                  // no finger
-                | ((((data[0] >> 4) | (data[2] >> 5)) & 1) << 2) // no signal / pulse searching
-                | (((data[0] >> 6) & 1) << 3);                 // beep
-        mOnDataChangeListener.packet(lastChunkMs, "BCI", -1, status, spo2, -1, pr, -1, -1, data[0] & 0x0F, -1,
-                wave, -1, -1, data[2] & 0x0F);
-    }
-
-    public void berryParse(int[] array) {
-        // Convert int[] to List<Integer> and add to buffArray
-        for (int value : array) {
-            buffArray.add(value);
-        }
-
-        int i = 0; // Current Index
-        int validIndex = 0; // Valid Index
-        int maxIndex = buffArray.size() - 20; // Data Space
-
-        while (i <= maxIndex) {
-            // Failed to match the headers
-            if (buffArray.get(i) != 0xFF || buffArray.get(i + 1) != 0xAA) {
-                i += 1;
-                validIndex = i;
-                continue;
-            }
-
-            // The header is successfully matched
-            int total = 0;
-            int checkSum = buffArray.get(i + 19);
-            for (int index = 0; index <= 18; index++) {
-                total += buffArray.get(i + index);
-            }
-
-            // If the verification fails, discard the two data
-            if (checkSum != (total % 256)) {
-                i += 2;
-                validIndex = i;
-                continue;
-            }
-
-            // Extracting a sublist for data
-            List<Integer> data = buffArray.subList(i, i + 19);
-
-            if (data.size() >= 19) {
-                int spo2 = data.get(4);
-                int pr = data.get(6);
-                int rr = (data.get(8) + (data.get(9) << 8)) * 5; // 200Hz
-                double pi = data.get(10) / 10.0;
-                int wave = data.get(12);
-                int packetFreq = data.get(18);
-
-                if (packetFreq == 0 && (data.get(2) == 0x53 || data.get(2) == 0x48)) {
-                    // version reply: 'S'/'H' then an ASCII string, zero padded (PacketFreq is never 0 in data)
-                    StringBuilder sb = new StringBuilder();
-                    for (int k = 3; k < 19 && data.get(k) != 0; k++) sb.append((char) (int) data.get(k));
-                    if (data.get(2) == 0x53) mOnDataChangeListener.softwareVersion(sb.toString());
-                    else mOnDataChangeListener.hardwareVersion(sb.toString());
-                } else {
-                    mOnDataChangeListener.value(spo2, rr, pr, pi, 0, wave, packetFreq);
-                    long adc = (data.get(13)) | (data.get(14) << 8) | (data.get(15) << 16) | ((long) data.get(16) << 24);
-                    if (adc >= 0x80000000L) adc -= 0x100000000L;   // signed int32, little endian
-                    mOnDataChangeListener.packet(lastChunkMs, "BERRY", data.get(2), data.get(3), spo2, data.get(5), pr,
-                            data.get(7), rr, pi, data.get(11) / 10.0, wave, adc, data.get(17), packetFreq);
-                }
-            }
-            i += 20; // Move back one group
-            validIndex = i;
-        }
-
-        // Update buffArray to retain only valid data
-        buffArray = new ArrayList<>(buffArray.subList(validIndex, buffArray.size()));
-    }
-
-    private int toUnsignedInt(byte x) {
-        return ((int) x) & 0xFF;
-    }
-
-    private int getData() {
-        try {
-            return oxiData.take();
-        } catch (Exception e) {
-            //noinspection CallToPrintStackTrace
-            e.printStackTrace();
-        }
-        return 0;
+        int pr = data[6];
+        int rr = (data[8] + (data[9] << 8)) * 5;          // 5 ms units
+        double pi = data[10] / 10.0;
+        int wave = data[12];
+        mOnDataChangeListener.value(spo2, rr, pr, pi, 0, wave, packetFreq);
+        long adc = (data[13]) | (data[14] << 8) | (data[15] << 16) | ((long) data[16] << 24);
+        if (adc >= 0x80000000L) adc -= 0x100000000L;       // signed int32, little endian
+        mOnDataChangeListener.packet(lastChunkMs, "BERRY", data[2], data[3], spo2, data[5], pr, data[7], rr, pi,
+                data[11] / 10.0, wave, adc, data[17], packetFreq);
     }
 
     private double _calculatePi(int lower, int higher) {
