@@ -274,6 +274,9 @@ public class MyBluetooth {
      */
     public void writeHex(String hex) {
         if (bleDevice != null) {
+            // FastBle's HexUtil does not strip "0x": "0xE1" became the two bytes FF E1 (FF = version query),
+            // so the protocol / rate commands never reached the device as single-byte commands.
+            hex = hex.trim().replaceFirst("^0[xX]", "");
             BleManager.getInstance().write(bleDevice,
                     Model.UUID_SERVICE_DATA,
                     Model.CHARACTERISTIC_UUID_RECEIVE,

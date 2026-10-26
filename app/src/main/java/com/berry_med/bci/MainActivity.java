@@ -20,6 +20,7 @@ import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.content.ContextCompat;
 import androidx.core.content.FileProvider;
 
 import com.berry_med.bci.blutooth.Model;
@@ -160,6 +161,13 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
             }
 
             @Override
+            public void packet(long hostMs, String proto, int devIdx, int status, int spo2, int spo2Real, int pr, int prReal,
+                               int rrMs, double pi, double piReal, int wave, long adc, int battery, int freq) {
+                // parser thread, not the UI thread: write straight to the CSV
+                myFiles.writePacket(hostMs, proto, devIdx, status, spo2, spo2Real, pr, prReal, rrMs, pi, piReal, wave, adc, battery, freq);
+            }
+
+            @Override
             public void hardwareVersion(String v) {
                 runOnUiThread(() -> hw.setText(v));
             }
@@ -178,6 +186,7 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
         if (mParseRunnable != null) mParseRunnable.setStop(false);
         if (launcher != null) launcher.unregister();
         if (myFiles != null) myFiles.close();
+        stopService(new Intent(this, RecordService.class));
     }
 
     @Override
@@ -242,14 +251,18 @@ public class MainActivity extends AppCompatActivity implements View.OnClickListe
                     rrTitle.setText("RR");
                     frequencyLayout.setVisibility(View.VISIBLE);
                     ble.writeHex("0xE1");
+                    // ask for the original (unfiltered) ADC sample once the switch has gone through
+                    mHandler.postDelayed(() -> ble.writeHex("0xF4"), 400);
                     break;
                 case 0x05:
-                    myFiles.createTxt();
+                    myFiles.createCsv();
+                    ContextCompat.startForegroundService(MainActivity.this, new Intent(MainActivity.this, RecordService.class));
                     startRecord.setText("Stop");
                     break;
                 case 0x06:
                     startRecord.setText("Start");
-                    myFiles.close();
+                    myFiles.closeCsv();
+                    stopService(new Intent(MainActivity.this, RecordService.class));
                     break;
                 case 0x07:
                     ToastUtil.showToastShort("Please connect the device!");
